@@ -1,4 +1,60 @@
-"""Base LLM provider interface."""
+"""
+LLM Provider 基础接口 (Base LLM Provider Interface)
+
+本模块定义了所有 LLM 供应商的抽象基类和公共数据结构。
+
+设计理念：
+- 抽象工厂模式：LLMProvider 是抽象基类，各供应商实现具体类
+- 统一接口：无论底层是 OpenAI、Anthropic 还是本地模型，对外接口一致
+- 容错机制：内置重试逻辑、错误分类、降级策略
+- 流式支持：可选的流式输出能力
+
+支持的供应商类型：
+1. 云端 API:
+   - Anthropic (Claude 系列)
+   - OpenAI (GPT 系列)
+   - DeepSeek (深度求索)
+   - Google Gemini
+   - Moonshot (月之暗面)
+   - ZhiPu (智谱)
+   - 等等...
+
+2. 聚合网关:
+   - OpenRouter (多模型路由)
+   - AiHubMix, SiliconFlow
+
+3. 本地模型:
+   - Ollama (本地部署)
+   - vLLM (高性能推理)
+   - LM Studio
+   - OVMS
+
+核心数据流::
+
+    用户消息 → AgentLoop.build_messages()
+            → Provider.chat() 或 chat_stream()
+            → HTTP API 调用
+            → LLMResponse (响应)
+            → AgentRunner 处理工具调用
+            → 循环直到完成
+
+重试机制：
+- 自动重试瞬态错误（429 限流、5xx 服务器错误）
+- 支持两种模式：standard（有限重试）和 persistent（持续重试）
+- 智能退避：解析 Retry-After 头部或错误消息中的等待时间
+- 图像降级：非瞬态错误时尝试去除图像后重试
+
+使用示例（自定义 Provider）::
+
+    class MyProvider(LLMProvider):
+        async def chat(self, messages, tools=None, model=None, ...):
+            # 实现你的 API 调用逻辑
+            response = await my_api_call(messages)
+            return LLMResponse(content=response.text)
+
+        def get_default_model(self) -> str:
+            return "my-model-v1"
+"""
 
 import asyncio
 import json
@@ -18,13 +74,49 @@ from nanobot.utils.helpers import image_placeholder_text
 
 @dataclass
 class ToolCallRequest:
-    """A tool call request from the LLM."""
-    id: str
-    name: str
-    arguments: dict[str, Any]
-    extra_content: dict[str, Any] | None = None
-    provider_specific_fields: dict[str, Any] | None = None
-    function_provider_specific_fields: dict[str, Any] | None = None
+    """
+    工具调用请求 (Tool Call Request)
+
+    表示 LLM 返回的一次工具调用请求。
+
+    当 LLM 决定调用工具时，会返回结构化的工具调用信息，
+    AgentRunner 解析后执行对应的工具函数。
+
+    Attributes:
+        id: 唯一的工具调用标识符（如 "call_abc123"）
+           用于关联请求和结果
+        
+        name: 工具名称（如 "web_search", "read_file", "execute_command"）
+             必须在 ToolRegistry 中注册过
+
+        arguments: 工具参数字典，键值对应工具的参数定义
+                 例如 {"query": "Python 异步编程", "num_results": 5}
+
+        extra_content: 额外内容（保留字段，通常为 None）
+        
+        provider_specific_fields: 供应商特有字段
+                                （如 Anthropic 的扩展信息）
+
+        function_provider_specific_fields: 函数级别的供应商特有字段
+
+    序列化示例::
+
+        request.to_openai_tool_call()
+        # {
+        #     "id": "call_123",
+        #     "type": "function",
+        #     "function": {
+        #         "name": "web_search",
+        #         "arguments": "{\"query\": \"天气\"}"
+        #     }
+        # }
+    """
+    id: str                                                    # 调用 ID (用于关联请求-响应)
+    name: str                                                  # 工具名称
+    arguments: dict[str, Any]                                  # 参数字典
+    extra_content: dict[str, Any] | None = None                # 额外内容
+    provider_specific_fields: dict[str, Any] | None = None     # 供应商特有字段
+    function_provider_specific_fields: dict[str, Any] | None = None  # 函数级供应商字段
 
     def to_openai_tool_call(self) -> dict[str, Any]:
         """Serialize to an OpenAI-style tool_call payload."""
@@ -47,21 +139,74 @@ class ToolCallRequest:
 
 @dataclass
 class LLMResponse:
-    """Response from an LLM provider."""
-    content: str | None
-    tool_calls: list[ToolCallRequest] = field(default_factory=list)
-    finish_reason: str = "stop"
-    usage: dict[str, int] = field(default_factory=dict)
-    retry_after: float | None = None  # Provider supplied retry wait in seconds.
-    reasoning_content: str | None = None  # Kimi, DeepSeek-R1, MiMo etc.
-    thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
-    # Structured error metadata used by retry policy when finish_reason == "error".
-    error_status_code: int | None = None
-    error_kind: str | None = None  # e.g. "timeout", "connection"
-    error_type: str | None = None  # Provider/type semantic, e.g. insufficient_quota.
-    error_code: str | None = None  # Provider/code semantic, e.g. rate_limit_exceeded.
-    error_retry_after_s: float | None = None
-    error_should_retry: bool | None = None
+    """
+    LLM 响应 (LLM Response)
+
+    封装 LLM API 的完整响应，包含内容、工具调用、使用统计和错误信息。
+
+    Attributes:
+        content: 文本回复内容（可能为 None，如果只返回工具调用）
+        
+        tool_calls: 工具调用请求列表
+                   （LLM 决定调用工具时的结构化请求）
+        
+        finish_reason: 完成原因，决定 Agent 下一步行为：
+                      - "stop": 正常完成，有文本回复
+                      - "end_turn": 正常完成，无更多操作
+                      - "tool_calls": 需要执行工具
+                      - "max_iterations": 达到最大迭代次数
+                      - "error": 发生错误
+
+        usage: Token 使用统计：
+              - "prompt_tokens": 输入 token 数
+              - "completion_tokens": 输出 token 数
+              - "total_tokens": 总计 token 数
+
+        retry_after: 供应商建议的重试等待时间（秒）
+                    （从 Retry-After 头部解析）
+
+        reasoning_content: 推理内容文本
+                         （DeepSeek-R1, Kimi, MiMo 等推理模型）
+
+        thinking_blocks: 思考块列表（Anthropic 扩展思考模式）
+                        （包含签名验证的思考过程）
+
+        ===== 错误信息字段（finish_reason="error" 时设置）=====
+        
+        error_status_code: HTTP 状态码（如 429, 500, 503）
+        
+        error_kind: 错误分类（"timeout", "connection" 等）
+        
+        error_type: 供应商语义错误类型
+                  （如 "insufficient_quota", "rate_limit_exceeded"）
+        
+        error_code: 供应商错误代码
+        
+        error_retry_after_s: 错误中提取的建议重试时间
+        
+        error_should_retry: 是否应该重试此错误
+                           （None 表示自动判断）
+
+    判断是否需要执行工具::
+
+        response.should_execute_tools  # → True/False
+        # 条件：有 tool_calls AND finish_reason in ("tool_calls", "function_call", "stop")
+    """
+    content: str | None                                          # 文本回复内容
+    tool_calls: list[ToolCallRequest] = field(default_factory=list)  # 工具调用列表
+    finish_reason: str = "stop"                                  # 完成原因
+    usage: dict[str, int] = field(default_factory=dict)           # Token 使用统计
+    retry_after: float | None = None                              # 建议重试等待时间 (秒)
+    reasoning_content: str | None = None                          # 推理内容（推理模型）
+    thinking_blocks: list[dict] | None = None                     # 思考块（Anthropic）
+
+    # ===== 错误元数据 =====
+    error_status_code: int | None = None                         # HTTP 状态码
+    error_kind: str | None = None                                 # 错误分类
+    error_type: str | None = None                                 # 语义错误类型
+    error_code: str | None = None                                 # 供应商错误码
+    error_retry_after_s: float | None = None                     # 重试等待时间
+    error_should_retry: bool | None = None                       # 是否可重试
 
     @property
     def has_tool_calls(self) -> bool:
@@ -90,7 +235,61 @@ _SYNTHETIC_USER_CONTENT = "(conversation continued)"
 
 
 class LLMProvider(ABC):
-    """Base class for LLM providers."""
+    """
+    LLM 供应商抽象基类 (Abstract LLM Provider)
+
+    所有 LLM 供应商（OpenAI, Anthropic, DeepSeek, Ollama 等）的公共接口。
+
+    子类必须实现：
+    - chat(): 发送聊天请求并获取响应
+    - get_default_model(): 返回默认模型名称
+
+    可选择性覆盖：
+    - chat_stream(): 实现流式输出（默认回退到非流式）
+    
+    内置功能：
+    - 重试机制：自动重试瞬态错误，支持两种模式
+    - 消息清理：自动处理空内容、角色交替等问题
+    - 图像处理：支持在出错时去除图像后重试
+    - 心跳报告：重试期间可调用回调通知用户
+
+    错误分类策略：
+    - 瞬态错误（可重试）：429 限流, 5xx 服务器错误, 超时, 连接错误
+    - 非瞬态错误（不重试）：401 认证失败, 403 权限不足
+    - 配额耗尽（特殊处理）：区分 rate_limit 和 insufficient_quota
+
+    使用示例::
+
+        # 创建 Provider 实例
+        provider = OpenAICompatibleProvider(
+            api_key="sk-xxx",
+            api_base="https://api.openai.com/v1"
+        )
+        
+        # 发送请求（带重试）
+        response = await provider.chat_with_retry(
+            messages=[{"role": "user", "content": "你好"}],
+            model="gpt-4o",
+            max_tokens=1024,
+        )
+        print(response.content)
+        
+        # 流式请求
+        async def on_delta(text: str):
+            print(text, end="", flush=True)
+        
+        response = await provider.chat_stream_with_retry(
+            messages=[...],
+            on_content_delta=on_delta,
+            retry_mode="persistent",  # 持续重试直到成功
+        )
+
+    Attributes:
+        api_key: API 密钥
+        api_base: API 基础 URL
+        generation: 默认生成参数（temperature, max_tokens 等）
+        supports_progress_deltas: 是否支持原生进度增量输出
+    """
 
     supports_progress_deltas = False
 

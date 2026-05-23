@@ -1,50 +1,50 @@
-# In-Chat Commands
+# 聊天内命令
 
-These commands work inside chat channels and interactive agent sessions:
+这些命令可在聊天频道和交互式 agent 会话中使用：
 
-| Command | Description |
-|---------|-------------|
-| `/new` | Stop current task and start a new conversation |
-| `/stop` | Stop the current task |
-| `/restart` | Restart the bot |
-| `/status` | Show bot status |
-| `/model` | Show the current model and available model presets |
-| `/model <preset>` | Switch the runtime model preset for future turns |
-| `/dream` | Run Dream memory consolidation now |
-| `/dream-log` | Show the latest Dream memory change |
-| `/dream-log <sha>` | Show a specific Dream memory change |
-| `/dream-restore` | List recent Dream memory versions |
-| `/dream-restore <sha>` | Restore memory to the state before a specific change |
-| `/pairing` | List pending pairing requests |
-| `/pairing approve <code>` | Approve a pairing code |
-| `/pairing deny <code>` | Deny a pending pairing request |
-| `/pairing revoke <user_id>` | Revoke a previously approved user on the current channel |
-| `/pairing revoke <channel> <user_id>` | Revoke a previously approved user on a specific channel |
-| `/help` | Show available in-chat commands |
+| 命令 | 描述 |
+|------|------|
+| `/new` | 停止当前任务并开始新对话 |
+| `/stop` | 停止当前任务 |
+| `/restart` | 重启 Bot |
+| `/status` | 显示 Bot 状态 |
+| `/model` | 显示当前模型和可用的模型预设 |
+| `/model <preset>` | 为未来的回合切换运行时模型预设 |
+| `/dream` | 立即运行 Dream 记忆整合 |
+| `/dream-log` | 显示最新的 Dream 记忆变更 |
+| `/dream-log <sha>` | 显示特定的 Dream 记忆变更 |
+| `/dream-restore` | 列出最近的 Dream 记忆版本 |
+| `/dream-restore <sha>` | 将记忆恢复到特定变更之前的状态 |
+| `/pairing` | 列出待处理的配对请求 |
+| `/pairing approve <code>` | 批准配对码 |
+| `/pairing deny <code>` | 拒绝待处理的配对请求 |
+| `/pairing revoke <user_id>` | 撤销当前频道上先前批准的用户 |
+| `/pairing revoke <channel> <user_id>` | 撤销特定频道上先前批准的用户 |
+| `/help` | 显示可用的聊天内命令 |
 
-## Pairing
+## 配对（Pairing）
 
-When someone sends a DM to the bot and isn't on the allowlist — whether it's a new user or an existing user on a new channel — nanobot automatically replies with a **pairing code** (like `ABCD-EFGH`) that expires in 10 minutes. To grant them access:
+当有人向 Bot 发送私聊但不在允许列表中时 — 无论是新用户还是现有用户在新频道上 — nanobot 会自动回复一个**配对码**（如 `ABCD-EFGH`），该码在 10 分钟后过期。要授予他们访问权限：
 
 ```text
 /pairing approve ABCD-EFGH
 ```
 
-To see who's waiting, use `/pairing`. To remove someone later, use `/pairing revoke <user_id>` — you can find user IDs in the `/pairing list` output.
+要查看谁在等待，使用 `/pairing`。稍后要移除某人，使用 `/pairing revoke <user_id>` — 你可以在 `/pairing list` 输出中找到用户 ID。
 
-See [Configuration: Pairing](./configuration.md#pairing) for the full setup guide.
+完整的设置指南参见[配置：配对](./configuration.md#pairing)。
 
-## Model Presets
+## 模型预设
 
-Use `/model` to inspect the current runtime model:
+使用 `/model` 检查当前运行时模型：
 
 ```text
 /model
 ```
 
-The response shows the current model, the current preset, and the available preset names. `default` is always available and represents the model settings from `agents.defaults.*`.
+响应会显示当前模型、当前预设和可用的预设名称。`default` 始终可用，代表来自 `agents.defaults.*` 的模型设置。
 
-To switch presets for future turns:
+要切换未来回合的预设：
 
 ```text
 /model fast
@@ -52,21 +52,21 @@ To switch presets for future turns:
 /model default
 ```
 
-Preset names come from the top-level `modelPresets` config. Switching is runtime-only: it does not rewrite `config.json`, and an in-progress turn keeps using the model it started with. See [Configuration: Model presets](./configuration.md#model-presets) for setup details.
+预设名称来自顶层 `modelPresets` 配置。切换仅影响运行时：不会重写 `config.json`，进行中的回合保持使用其开始时的模型。设置详情参见[配置：模型预设](./configuration.md#model-presets)。
 
-## Periodic Tasks
+## 定期任务
 
-The gateway wakes up every 30 minutes and checks `HEARTBEAT.md` in your workspace (`~/.nanobot/workspace/HEARTBEAT.md`). If the file has tasks, the agent executes them and delivers results to your most recently active chat channel.
+网关每 30 分钟唤醒一次并检查你工作区（`~/.nanobot/workspace/HEARTBEAT.md`）中的 `HEARTBEAT.md` 文件。如果有任务，agent 会执行任务并将结果投递到你最近活跃的聊天频道。
 
-**Setup:** edit `~/.nanobot/workspace/HEARTBEAT.md` (created automatically by `nanobot onboard`):
+**设置：** 编辑 `~/.nanobot/workspace/HEARTBEAT.md`（由 `nanobot onboard` 自动创建）：
 
 ```markdown
-## Periodic Tasks
+## 定期任务
 
-- [ ] Check weather forecast and send a summary
-- [ ] Scan inbox for urgent emails
+- [ ] 查看天气预报并发送摘要
+- [ ] 扫描收件箱查找紧急邮件
 ```
 
-The agent can also manage this file itself — ask it to "add a periodic task" and it will update `HEARTBEAT.md` for you.
+Agent 也可以自己管理此文件 — 让它"添加定期任务"，它会为你更新 `HEARTBEAT.md`。
 
-> **Note:** The gateway must be running (`nanobot gateway`) and you must have chatted with the bot at least once so it knows which channel to deliver to.
+> **注意：** 网关必须正在运行（`nanobot gateway`），并且你必须至少与 Bot 聊过一次，这样它才知道要投递到哪个频道。

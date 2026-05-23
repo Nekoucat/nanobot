@@ -1,4 +1,39 @@
-"""Session management for conversation history."""
+"""
+会话管理器 (Session Manager)
+
+本模块负责对话会话的创建、加载、保存和生命周期管理。
+
+核心概念：
+- Session (会话): 一次完整的对话，包含消息历史和元数据
+- SessionManager (会话管理器): 管理所有会话的 CRUD 操作
+- 持久化: 会话以 JSONL 格式存储在磁盘上
+
+存储格式：
+- 文件路径: {workspace}/sessions/{safe_key}.jsonl
+- 每行一个 JSON 对象
+- 第一行是元数据 (_type: "metadata")
+- 后续行是消息记录
+
+文件格式示例::
+
+    {"_type": "metadata", "key": "telegram:12345", "created_at": "...", ...}
+    {"role": "user", "content": "你好", "timestamp": "..."}
+    {"role": "assistant", "content": "你好！有什么可以帮你的？", "timestamp": "..."}
+    {"role": "user", "content": "帮我查一下天气", "timestamp": "..."}
+    ...
+
+关键功能：
+1. 会话持久化：自动保存到 JSONL 文件，支持原子写入（先写临时再 rename）
+2. 历史回放：智能裁剪历史消息，适配 LLM 上下文窗口
+3. 消息压缩：超长会话自动归档旧消息
+4. 容错恢复：损坏的文件尝试修复读取
+5. 内存缓存：活跃会话缓存在内存中
+
+线程安全说明：
+- 所有公开方法都是同步的，应在 asyncio 事件循环中调用
+- save() 使用原子写入保证数据一致性
+- 缓存操作不是线程安全的，但单线程 asyncio 模式下无问题
+"""
 
 import json
 import os
@@ -76,14 +111,54 @@ def _message_preview_text(message: dict[str, Any]) -> str:
 
 @dataclass
 class Session:
-    """A conversation session."""
+    """
+    对话会话 (Conversation Session)
 
-    key: str  # channel:chat_id
-    messages: list[dict[str, Any]] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.now)
-    updated_at: datetime = field(default_factory=datetime.now)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    last_consolidated: int = 0  # Number of messages already consolidated to files
+    表示一次完整的对话，包含消息历史和元数据。
+
+    Attributes:
+        key: 唯一会话标识符
+            格式通常为 "{channel}:{chat_id}"
+            例如: "telegram:123456789", "cli:direct", "websocket:user-uuid"
+        
+        messages: 消息历史列表，每条消息是一个字典：
+            - role: 消息角色 ("user", "assistant", "system", "tool")
+            - content: 消息内容（字符串或 multimodal 内容列表）
+            - timestamp: ISO 格式时间戳
+            - tool_calls: 工具调用请求（assistant 角色可选）
+            - tool_call_id: 工具调用 ID（tool 角色可选）
+            - name: 工具名称（tool 角色可选）
+            - 其他自定义字段...
+
+        created_at: 会话创建时间
+        
+        updated_at: 最后更新时间（每次添加消息时自动更新）
+        
+        metadata: 会话元数据字典，存储：
+            - title: 会话标题（WebUI 使用）
+            - _last_summary: 最后的压缩摘要
+            - runtime_checkpoint: 运行时检查点（中断恢复用）
+            - pending_user_turn: 是否有待处理用户消息
+
+        last_consolidated: 已压缩归档的消息索引位置
+                          （messages[:last_consolidated] 已被归档到文件）
+
+    示例::
+
+        session = Session(key="telegram:12345")
+        session.add_message("user", "你好")
+        session.add_message(
+            "assistant",
+            "你好！有什么可以帮你的？",
+            tool_calls=[{"id": "call_1", "name": "web_search", ...}]
+        )
+    """
+    key: str                                                    # 会话标识 (channel:chat_id)
+    messages: list[dict[str, Any]] = field(default_factory=list) # 消息历史列表
+    created_at: datetime = field(default_factory=datetime.now)   # 创建时间
+    updated_at: datetime = field(default_factory=datetime.now)   # 更新时间
+    metadata: dict[str, Any] = field(default_factory=dict)       # 元数据
+    last_consolidated: int = 0                                  # 已归档的消息数量
 
     @staticmethod
     def _annotate_message_time(message: dict[str, Any], content: Any) -> Any:
@@ -308,9 +383,45 @@ class Session:
 
 class SessionManager:
     """
-    Manages conversation sessions.
+    会话管理器 (Session Manager)
 
-    Sessions are stored as JSONL files in the sessions directory.
+    管理所有对话会话的创建、加载、保存和查询。
+
+    存储机制：
+    - 会话以 JSONL 格式持久化到 {workspace}/sessions/ 目录
+    - 文件名: {safe_session_key}.jsonl
+    - 支持原子写入（先写 .tmp 文件，再 rename）
+    - 支持 fsync 确保数据落盘
+
+    内存缓存：
+    - 活跃会话缓存在 _cache 字典中
+    - get_or_create() 优先返回缓存
+    - invalidate() 可手动清除缓存
+    - save() 自动更新缓存
+
+    容错能力：
+    - 损坏的 JSONL 文件会尝试逐行解析恢复
+    - 修复后的会话记录警告日志
+    - 严重损坏返回 None 而非崩溃
+
+    使用示例::
+
+        manager = SessionManager(Path("~/.nanobot/workspace"))
+
+        # 获取或创建会话
+        session = manager.get_or_create("telegram:12345")
+
+        # 添加消息
+        session.add_message("user", "你好")
+
+        # 保存到磁盘
+        manager.save(session)
+
+        # 列出所有会话（用于 WebUI）
+        sessions = manager.list_sessions()
+
+        # 删除会话
+        manager.delete_session("telegram:12345")
     """
 
     def __init__(self, workspace: Path):

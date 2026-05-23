@@ -1,4 +1,46 @@
-"""Configuration schema using Pydantic."""
+"""
+配置模式 (Configuration Schema)
+
+本模块使用 Pydantic 定义 nanobot 的完整配置结构。
+
+设计原则：
+- 类型安全：所有配置项都有明确的类型和验证规则
+- 环境变量支持：通过 BaseSettings 支持从环境变量加载
+- 双命名兼容：同时支持 camelCase（JSON）和 snake_case（Python）
+- 分层组织：按功能域分组（agents, providers, channels, tools）
+
+配置文件位置：
+- 默认: ~/.nanobot/config.json
+- 可通过 NANOBOT_CONFIG 环境变量或命令行参数覆盖
+
+配置结构概览::
+
+    Config (根)
+    ├── agents: AgentDefaults          # Agent 核心设置
+    │   ├── model, provider            # 模型和供应商
+    │   ├── workspace                  # 工作目录
+    │   └── max_tool_iterations        # 最大迭代次数
+    ├── providers: ProvidersConfig     # LLM 供应商配置
+    │   ├── anthropic, openai          # 主流供应商
+    │   ├── openrouter, deepseek       # 聚合/国产供应商
+    │   └── ollama, vllm              # 本地模型
+    ├── channels: ChannelsConfig       # 通道配置
+    │   ├── send_progress              # 流式输出开关
+    │   └── transcription_provider     # 语音转文字后端
+    ├── tools: ToolsConfig             # 工具系统配置
+    │   ├── web, exec                  # 内置工具配置
+    │   ├── mcp_servers                # MCP 服务器列表
+    │   └── restrict_to_workspace      # 工具访问限制
+    ├── api: ApiConfig                 # API 服务器配置
+    └── gateway: GatewayConfig         # Gateway 服务器配置
+
+使用示例::
+
+    config = Config(
+        agents=AgentsConfig(defaults=AgentDefaults(model="deepseek/deepseek-chat")),
+        providers=ProvidersConfig(deepseek=ProviderConfig(api_key="sk-xxx"))
+    )
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -19,17 +61,39 @@ if TYPE_CHECKING:
 
 
 class Base(BaseModel):
-    """Base model that accepts both camelCase and snake_case keys."""
+    """
+    配置基类 (Base Configuration Model)
+
+    所有配置模型的公共基类，提供：
+    - camelCase 别名支持：JSON 中可用 camelCase 字段名
+    - snake_case 兼容：Python 代码中用 snake_case 访问
+    """
 
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
 
 class ChannelsConfig(Base):
-    """Configuration for chat channels.
+    """
+    聊天通道配置 (Chat Channels Configuration)
 
-    Built-in and plugin channel configs are stored as extra fields (dicts).
-    Each channel parses its own config in __init__.
-    Per-channel "streaming": true enables streaming output (requires send_delta impl).
+    控制所有聊天渠道的行为，包括 Telegram、Discord、Slack、飞书等。
+    
+    每个具体通道的配置存储为额外的字典字段（通过 extra="allow"）。
+    
+    Attributes:
+        send_progress: 是否向通道发送 Agent 的文本进度
+                      （如 "正在搜索...", "正在读取文件..."）
+        send_tool_hints: 是否发送工具调用提示
+                        （如 'read_file("path/to/file")'）
+        show_reasoning: 是否展示模型的推理过程
+                       （需要通道实现支持）
+        send_max_retries: 消息发送最大重试次数
+                         （初始发送计入总数，默认 3 次）
+        transcription_provider: 语音转文字后端
+                              - "groq": 使用 Groq Whisper API（快速免费）
+                              - "openai": 使用 OpenAI Whisper API
+        transcription_language: ISO-639-1 语言代码提示
+                               （如 "zh" 表示中文，可选）
     """
 
     model_config = ConfigDict(extra="allow")
@@ -109,7 +173,62 @@ class ModelPresetConfig(Base):
 
 
 class AgentDefaults(Base):
-    """Default agent configuration."""
+    """
+    Agent 默认配置 (Agent Default Settings)
+
+    定义 Agent 的核心运行参数，是配置文件中 agents.defaults 部分的结构。
+
+    Attributes:
+        workspace: 工作目录路径，用于存储会话、记忆、技能等数据
+                  （默认: "~/.nanobot/workspace"）
+        model_preset: 活跃的模型预设名称（优先级高于以下字段）
+                     （预设定义在 Config.model_presets 中）
+        model: 默认模型名称，格式为 "provider/model-id"
+              （如 "anthropic/claude-sonnet-4", "deepseek/deepseek-chat"）
+              （默认: "anthropic/claude-opus-4-5"）
+        provider: 供应商名称或 "auto" 自动检测
+                （支持: anthropic, openai, deepseek, ollama, vllm 等）
+        max_tokens: LLM 单次响应的最大 token 数
+                 （默认: 8192）
+        context_window_tokens: 上下文窗口大小（token 数）
+                             （默认: 65536 = 64K）
+        temperature: 采样温度，控制回复的随机性
+                   （0.0 = 确定性，1.0 = 高随机性；默认: 0.1）
+        fallback_models: 备用模型列表（主模型失败时按顺序尝试）
+                       （可以是模型名称字符串或 InlineFallbackConfig 对象）
+        max_tool_iterations: 单轮对话最大工具调用次数
+                            （默认: 200；防止无限循环）
+        max_concurrent_subagents: 最大并发子 Agent 数
+                                （默认: 1）
+        max_tool_result_chars: 工具返回结果的最大字符数
+                            （超过会被截断；默认: 16000）
+        provider_retry_mode: Provider 重试模式
+                           - "standard": 标准重试（最多 N 次）
+                           - "persistent": 持续重试（直到成功或手动停止）
+        tool_hint_max_length: 工具提示显示的最大字符长度
+                            （默认: 40，范围: 20-500）
+        reasoning_effort: 推理努力程度
+                         （low/medium/high/adaptive/none 或 None 用供应商默认值）
+        timezone: IANA 时区标识符
+                （如 "Asia/Shanghai", "America/New_York"；默认: "UTC"）
+        bot_name: CLI 中显示的机器人名称
+                （默认: "nanobot"）
+        bot_icon: 机器人图标（emoji 或文本）
+               （默认: "🐈"；设为 "" 可禁用）
+        unified_session: 是否启用统一会话模式
+                       （True = 所有通道共享一个会话；
+                        False = 每个通道:聊天ID 独立会话）
+        disabled_skills: 要禁用的技能名列表
+                      （如 ["summarize", "skill-creator"]）
+        session_ttl_minutes: 会话空闲过期时间（分钟）
+                           （0 = 禁用过期压缩；默认: 0）
+        max_messages: 从会话历史回放的最大消息数
+                    （0 = 使用默认值 120；受 token budget 约束）
+        consolidation_ratio: 记忆压缩目标比率
+                           （0.5 = 压缩后保留 50% 的内容；默认: 0.5）
+        dream: Dream 记忆整合配置
+             （控制定时记忆整理和去重任务）
+    """
 
     workspace: str = "~/.nanobot/workspace"
     model_preset: str | None = None  # Active preset name — takes precedence over fields below
@@ -288,7 +407,61 @@ class ToolsConfig(Base):
 
 
 class Config(BaseSettings):
-    """Root configuration for nanobot."""
+    """
+    根配置类 (Root Configuration)
+
+    nanobot 的完整配置对象，包含所有子配置。
+
+    环境变量支持：
+    - 所有字段都可通过环境变量覆盖
+    - 前缀: NANOBOT__
+    - 嵌套分隔符: __ (双下划线)
+    - 例如: agents.defaults.model → NANOBOT__AGENTS__DEFAULTS__MODEL
+
+    示例配置文件 (config.json)::
+
+        {
+            "agents": {
+                "defaults": {
+                    "model": "deepseek/deepseek-chat",
+                    "provider": "deepseek",
+                    "workspace": "./my_workspace"
+                }
+            },
+            "providers": {
+                "deepseek": {
+                    "apiKey": "sk-xxxxxxxx"
+                }
+            },
+            "channels": {
+                "sendProgress": true,
+                "showReasoning": false
+            },
+            "tools": {
+                "restrictToWorkspace": true,
+                "mcpServers": {}
+            },
+            "modelPresets": {
+                "fast": {
+                    "model": "deepseek/deepseek-chat",
+                    "maxTokens": 4096
+                },
+                "smart": {
+                    "model": "anthropic/claude-sonnet-4",
+                    "maxTokens": 8192
+                }
+            }
+        }
+
+    Attributes:
+        agents: Agent 配置（含默认设置）
+        channels: 聊天通道全局配置
+        providers: LLM 供应商配置集合
+        api: OpenAI 兼容 API 服务器配置
+        gateway: Gateway/WebSocket 服务器配置
+        tools: 工具系统配置
+        model_presets: 命名模型预设字典
+    """
 
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)

@@ -1,4 +1,34 @@
-"""Agent loop: the core processing engine."""
+"""
+Agent 循环 (Agent Loop) - nanobot 的核心处理引擎 (Core Processing Engine)
+
+本模块实现了 Agent 的事件驱动状态机，是整个框架的中枢神经系统。
+
+核心职责：
+1. 从消息总线接收用户消息
+2. 构建完整的上下文（系统提示 + 历史 + 记忆 + 技能）
+3. 调用 LLM 获取响应
+4. 执行工具调用循环
+5. 将结果返回给调用方
+
+架构设计：
+- 采用有限状态机 (FSM) 模式处理消息流转
+- 状态序列: RESTORE -> COMPACT -> COMMAND -> BUILD -> RUN -> SAVE -> RESPOND -> DONE
+- 支持并发会话处理（每个会话独立锁）
+- 支持消息中途注入（turn injection）实现流式交互
+- 集成 MCP (Model Context Protocol) 工具服务器
+
+关键组件：
+- MessageBus: 异步消息队列，解耦通道和 Agent
+- SessionManager: 会话持久化与管理
+- ToolRegistry: 工具注册与调度
+- Consolidator: 长对话记忆压缩
+- SubagentManager: 子 Agent 管理器
+
+线程安全说明：
+- 每个会话有独立的 asyncio.Lock 保证串行处理
+- 使用 asyncio.Semaphore 控制全局并发数
+- 文件状态通过 contextvars 实现会话隔离
+"""
 
 from __future__ import annotations
 
@@ -58,74 +88,188 @@ if TYPE_CHECKING:
     from nanobot.cron.service import CronService
 
 
+# 统一会话模式下的默认会话标识
+# 当 unified_session 开启时，所有通道共享此会话
 UNIFIED_SESSION_KEY = "unified:default"
 
 class TurnState(Enum):
-    RESTORE = auto()
-    COMPACT = auto()
-    COMMAND = auto()
-    BUILD = auto()
-    RUN = auto()
-    SAVE = auto()
-    RESPOND = auto()
-    DONE = auto()
+    """
+    Agent 处理回合的状态枚举 (Turn State Machine)
+
+    定义消息处理的完整生命周期状态，采用有限状态机模式流转：
+
+    状态流转图：
+        RESTORE ──ok──> COMPACT ──ok──> COMMAND
+                                              │
+                              ┌─shortcut──────┤
+                              │               │ dispatch
+                              ▼               ▼
+                            BUILD <──────────┘
+                              │ ok
+                              ▼
+                             RUN ──ok──> SAVE ──ok──> RESPOND ──ok──> DONE
+
+    各状态说明:
+    - RESTORE:   恢复中断的回合（检查点恢复、待处理用户消息）
+    - COMPACT:   会话压缩（清理过期会话、触发记忆合并）
+    - COMMAND:   命令解析（处理 /new, /stop 等斜杠命令）
+    - BUILD:     构建上下文（组装系统提示 + 历史消息 + 工具定义）
+    - RUN:       运行 Agent 循环（调用 LLM + 执行工具调用）
+    - SAVE:      保存结果（持久化消息到会话文件）
+    - RESPOND:   组装响应（生成 OutboundMessage 发送到总线）
+    - DONE:      回合完成（清理资源，等待下一条消息）
+    """
+    RESTORE = auto()     # 恢复状态：加载检查点和中途用户消息
+    COMPACT = auto()     # 压缩状态：处理过期会话和记忆整理
+    COMMAND = auto()     # 命令状态：检测和处理斜杠命令
+    BUILD = auto()       # 构建状态：准备 LLM 调用的完整上下文
+    RUN = auto()         # 运行状态：执行核心 Agent 循环（LLM + 工具）
+    SAVE = auto()        # 保存状态：将本轮结果持久化到会话
+    RESPOND = auto()     # 响应状态：组装最终回复消息
+    DONE = auto()        # 完成状态：清理并结束当前回合
 
 
 @dataclass
 class StateTraceEntry:
-    state: TurnState
-    started_at: float
-    duration_ms: float
-    event: str
-    error: str | None = None
+    """
+    状态追踪条目 (State Trace Entry)
+
+    记录单个状态处理过程的详细信息，用于调试和性能分析。
+
+    Attributes:
+        state: 当前状态 (TurnState 枚举值)
+        started_at: 状态开始处理的时间戳 (time.perf_counter)
+        duration_ms: 该状态的执行耗时（毫秒）
+        event: 触发状态转换的事件名称（如 "ok", "dispatch", "shortcut"）
+        error: 如果该状态处理出错，记录错误信息；否则为 None
+    """
+    state: TurnState           # 当前所处状态
+    started_at: float          # 开始时间 (perf_counter)
+    duration_ms: float         # 执行耗时 (毫秒)
+    event: str                 # 触发的转换事件
+    error: str | None = None   # 错误信息（如果有）
 
 
 @dataclass
 class TurnContext:
-    msg: InboundMessage
-    session_key: str
-    state: TurnState
-    turn_id: str
-    session: Session | None = None
+    """
+    回合上下文 (Turn Context)
 
-    history: list[dict[str, Any]] = field(default_factory=list)
-    initial_messages: list[dict[str, Any]] = field(default_factory=list)
+    存储单次消息处理的完整运行时状态，在各个状态处理器之间传递。
 
-    final_content: str | None = None
-    tools_used: list[str] = field(default_factory=list)
-    all_messages: list[dict[str, Any]] = field(default_factory=list)
-    stop_reason: str = ""
-    had_injections: bool = False
+    这是 Agent 处理一条用户消息时的"工作内存"，包含了从接收到回复的
+    全过程数据。每个字段都有明确的用途和生命周期：
 
-    user_persisted_early: bool = False
-    save_skip: int = 0
+    核心字段:
+        - msg: 原始入站消息（不可变）
+        - session_key: 会话标识符，用于路由和持久化
+        - state: 当前 FSM 状态
 
-    outbound: OutboundMessage | None = None
+    消息历史:
+        - history: 从会话加载的历史消息列表
+        - initial_messages: 发送给 LLM 的完整消息数组（包含 system prompt）
 
-    on_progress: Callable[..., Awaitable[None]] | None = None
-    on_stream: Callable[[str], Awaitable[None]] | None = None
-    on_stream_end: Callable[..., Awaitable[None]] | None = None
-    on_retry_wait: Callable[[str], Awaitable[None]] | None = None
+    结果字段:
+        - final_content: LLM 的最终文本回复
+        - tools_used: 本轮调用的工具名称列表
+        - all_messages: 完整的消息交互记录（含工具调用）
+        - stop_reason: LLM 停止原因 ("stop", "end_turn", "max_iterations" 等)
 
-    pending_queue: asyncio.Queue | None = None
-    pending_summary: str | None = None
+    流式回调:
+        - on_progress: 进度更新回调（工具调用提示等）
+        - on_stream: 文本流式输出回调（每个 delta 调用）
+        - on_stream_end: 流式段落结束回调
+        - on_retry_wait: 重试等待通知回调
 
-    turn_wall_started_at: float = field(default_factory=time.time)
-    turn_latency_ms: int | None = None
+    中途注入:
+        - pending_queue: 待注入的消息队列（支持 turn 内接收新消息）
+        - pending_summary: 待注入的消息摘要（来自压缩）
+    """
+    msg: InboundMessage                                    # 触发本轮的用户消息
+    session_key: str                                       # 会话标识 (如 "telegram:12345")
+    state: TurnState                                       # 当前 FSM 状态
+    turn_id: str                                           # 唯一的回合 ID (用于日志追踪)
+    session: Session | None = None                         # 会话对象（RESTORE 阶段加载）
 
-    trace: list[StateTraceEntry] = field(default_factory=list)
+    # ===== 消息相关 =====
+    history: list[dict[str, Any]] = field(default_factory=list)      # 原始历史消息
+    initial_messages: list[dict[str, Any]] = field(default_factory=list)  # LLM 输入消息
+
+    # ===== 运行结果 =====
+    final_content: str | None = None                      # 最终文本回复内容
+    tools_used: list[str] = field(default_factory=list)   # 调用的工具名列表
+    all_messages: list[dict[str, Any]] = field(default_factory=list)  # 完整消息记录
+    stop_reason: str = ""                                 # LLM 停止原因
+    had_injections: bool = False                          # 是否有中途注入消息
+
+    # ===== 持久化控制 =====
+    user_persisted_early: bool = False                    # 用户消息是否提前持久化
+    save_skip: int = 0                                    # 保存时跳过的消息数
+
+    # ===== 输出 =====
+    outbound: OutboundMessage | None = None               # 最终出站消息
+
+    # ===== 回调函数 =====
+    on_progress: Callable[..., Awaitable[None]] | None = None     # 进度回调
+    on_stream: Callable[[str], Awaitable[None]] | None = None      # 流式文本回调
+    on_stream_end: Callable[..., Awaitable[None]] | None = None    # 流式结束回调
+    on_retry_wait: Callable[[str], Awaitable[None]] | None = None  # 重试等待回调
+
+    # ===== 中途注入 =====
+    pending_queue: asyncio.Queue | None = None            # 待注入消息队列
+    pending_summary: str | None = None                    # 压缩摘要
+
+    # ===== 性能监控 =====
+    turn_wall_started_at: float = field(default_factory=time.time)  # 回合开始时间
+    turn_latency_ms: int | None = None                    # 总延迟（毫秒）
+
+    # ===== 调试追踪 =====
+    trace: list[StateTraceEntry] = field(default_factory=list)  # 状态转换轨迹
 
 
 class AgentLoop:
     """
-    The agent loop is the core processing engine.
+    Agent 循环 (Agent Loop) - 核心处理引擎
 
-    It:
-    1. Receives messages from the bus
-    2. Builds context with history, memory, skills
-    3. Calls the LLM
-    4. Executes tool calls
-    5. Sends responses back
+    这是 nanobot 框架的中枢组件，负责：
+    1. 从消息总线 (MessageBus) 接收用户消息
+    2. 使用状态机模式处理每条消息（RESTORE -> COMPACT -> ... -> DONE）
+    3. 构建完整的 LLM 上下文（系统提示 + 历史 + 记忆 + 技能）
+    4. 调用大语言模型获取响应
+    5. 执行工具调用循环（最多 max_iterations 次）
+    6. 将响应发送回消息总线
+
+    架构特点：
+    - 异步设计：基于 asyncio，支持高并发
+    - 会话隔离：每个会话独立处理，互不干扰
+    - 可扩展：通过钩子 (AgentHook) 机制支持自定义行为
+    - 容错：支持检查点恢复、消息重试、优雅降级
+
+    典型工作流程示例::
+
+        # 创建 AgentLoop
+        loop = AgentLoop.from_config(config)
+
+        # 启动后台任务处理消息
+        task = asyncio.create_task(loop.run())
+
+        # 发布一条消息
+        await loop.bus.publish_inbound(InboundMessage(
+            channel="cli",
+            sender_id="user",
+            chat_id="direct",
+            content="你好"
+        ))
+
+        # 等待并获取响应
+        response = await loop.bus.consume_outbound()
+        print(response.content)  # "你好！有什么可以帮你的吗？"
+
+    配置项说明：
+        - model: 使用的模型名称（如 "anthropic/claude-sonnet-4"）
+        - max_iterations: 单轮最大工具调用次数（默认 200）
+        - context_window_tokens: 上下文窗口大小（默认 65536）
+        - workspace: 工作目录路径（存储会话、记忆等数据）
     """
 
     @property

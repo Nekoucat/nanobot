@@ -1,17 +1,17 @@
-# Deployment
+# 部署指南
 
 ## Docker
 
 > [!TIP]
-> The `-v ~/.nanobot:/home/nanobot/.nanobot` flag mounts your local config directory into the container, so your config and workspace persist across container restarts.
-> The container runs as the non-root user `nanobot` (UID 1000) and reads config from `/home/nanobot/.nanobot`. Always mount your host config directory to `/home/nanobot/.nanobot`, not `/root/.nanobot`.
-> If you get **Permission denied**, fix ownership on the host first: `sudo chown -R 1000:1000 ~/.nanobot`, or pass `--user $(id -u):$(id -g)` to match your host UID. Podman users can use `--userns=keep-id` instead.
+> `-v ~/.nanobot:/home/nanobot/.nanobot` 标志会将你的本地配置目录挂载到容器中，这样你的配置和工作区在容器重启后持久保存。
+> 容器以非 root 用户 `nanobot`（UID 1000）运行，并从 `/home/nanobot/.nanobot` 读取配置。始终将主机配置目录挂载到 `/home/nanobot/.nanobot`，而不是 `/root/.nanobot`。
+> 如果你遇到**权限拒绝**错误，请先在主机上修复所有权：`sudo chown -R 1000:1000 ~/.nanobot`，或者传递 `--user $(id -u):$(id -g)` 以匹配你的主机 UID。Podman 用户可以改用 `--userns=keep-id`。
 >
 > [!IMPORTANT]
-> Official Docker usage currently means building from this repository with the included `Dockerfile`. Docker Hub images under third-party namespaces are not maintained or verified by HKUDS/nanobot; do not mount API keys or bot tokens into them unless you trust the publisher.
-
+> 目前官方 Docker 用法意味着使用本仓库包含的 `Dockerfile` 进行构建。第三方命名空间下的 Docker Hub 镜像不由 HKUDS/nanobot 维护或验证；除非你信任发布者，否则不要在其中挂载 API 密钥或 Bot Token。
+>
 > [!IMPORTANT]
-> The gateway and WebSocket channel default to `host: "127.0.0.1"` in `config.json` (set in `nanobot/config/schema.py`). Docker `-p` port forwarding cannot reach a container's loopback interface, so for the host or LAN to reach the exposed ports you must set both binds to `0.0.0.0` in `~/.nanobot/config.json` before starting the container:
+> 网关和 WebSocket 频道在 `config.json` 中默认为 `host: "127.0.0.1"`（在 `nanobot/config/schema.py` 中设置）。Docker `-p` 端口转发无法到达容器的环回接口，因此要使主机或 LAN 能够访问暴露的端口，必须在启动容器前将两者都设为 `0.0.0.0`（写入 `~/.nanobot/config.json`）：
 >
 > ```json
 > {
@@ -20,41 +20,41 @@
 > }
 > ```
 >
-> When `host` is `0.0.0.0`, the gateway refuses to start unless `token` or `tokenIssueSecret` is also configured on the WebSocket channel — see [`webui/README.md`](../webui/README.md) for details.
+> 当 `host` 为 `0.0.0.0` 时，除非还在 WebSocket 频道上配置了 `token` 或 `tokenIssueSecret`，否则网关会拒绝启动 — 详情参见 [`webui/README.md`](../webui/README.md)。
 
 ### Docker Compose
 
 ```bash
-docker compose run --rm nanobot-cli onboard   # first-time setup
-vim ~/.nanobot/config.json                     # add API keys
-docker compose up -d nanobot-gateway           # start gateway
+docker compose run --rm nanobot-cli onboard   # 首次设置
+vim ~/.nanobot/config.json                     # 添加 API 密钥
+docker compose up -d nanobot-gateway           # 启动网关
 ```
 
 ```bash
-docker compose run --rm nanobot-cli agent -m "Hello!"   # run CLI
-docker compose logs -f nanobot-gateway                   # view logs
-docker compose down                                      # stop
+docker compose run --rm nanobot-cli agent -m "你好！"   # 运行 CLI
+docker compose logs -f nanobot-gateway                   # 查看日志
+docker compose down                                      # 停止
 ```
 
 ### Docker
 
 ```bash
-# Build the image
+# 构建镜像
 docker build -t nanobot .
 
-# Initialize config (first time only)
+# 初始化配置（仅需首次）
 docker run -v ~/.nanobot:/home/nanobot/.nanobot --rm nanobot onboard
 
-# Edit config on host to add API keys
+# 在主机上编辑配置以添加 API 密钥
 vim ~/.nanobot/config.json
 
-# Run gateway (connects to enabled channels, e.g. Telegram/Discord/Mochat).
-# Mirrors the security caps and port mappings declared in docker-compose.yml:
-#   - `--cap-drop ALL --cap-add SYS_ADMIN` + unconfined apparmor/seccomp are required
-#     when `tools.exec.sandbox: "bwrap"` is enabled (bwrap needs CAP_SYS_ADMIN for
-#     user namespaces). Without them, `bwrap` exits with `clone3: Operation not permitted`.
-#   - `-p 8765:8765` exposes the WebSocket channel / WebUI alongside the gateway health
-#     endpoint on 18790.
+# 运行网关（连接到启用的频道，如 Telegram/Discord/Mochat）。
+# 镜像 docker-compose.yml 中声明的安全限制和端口映射：
+#   - `--cap-drop ALL --cap-add SYS_ADMIN` + unconfined apparmor/seccomp 在
+#     `tools.exec.sandbox: "bwrap"` 启用时是必需的（bwrap 需要 CAP_SYS_ADMIN 用于
+#     用户命名空间）。没有它们，`bwrap` 会因 `clone3: Operation not permitted` 退出。
+#   - `-p 8765:8765` 暴露 WebSocket 频道 / WebUI 以及网关健康检查
+#     端口 18790。
 docker run \
   --cap-drop ALL --cap-add SYS_ADMIN \
   --security-opt apparmor=unconfined \
@@ -63,22 +63,22 @@ docker run \
   -p 18790:18790 -p 8765:8765 \
   nanobot gateway
 
-# Or run a single command
-docker run -v ~/.nanobot:/home/nanobot/.nanobot --rm nanobot agent -m "Hello!"
+# 或者运行单个命令
+docker run -v ~/.nanobot:/home/nanobot/.nanobot --rm nanobot agent -m "你好！"
 docker run -v ~/.nanobot:/home/nanobot/.nanobot --rm nanobot status
 ```
 
-## Linux Service
+## Linux 服务（Systemd）
 
-Run the gateway as a systemd user service so it starts automatically and restarts on failure.
+将网关作为 systemd 用户服务运行，使其自动启动并在故障时重启。
 
-**1. Find the nanobot binary path:**
+**1. 找到 nanobot 二进制路径：**
 
 ```bash
-which nanobot   # e.g. /home/user/.local/bin/nanobot
+which nanobot   # 例如 /home/user/.local/bin/nanobot
 ```
 
-**2. Create the service file** at `~/.config/systemd/user/nanobot-gateway.service` (replace `ExecStart` path if needed):
+**2. 在 `~/.config/systemd/user/nanobot-gateway.service` 创建服务文件**（如需要替换 `ExecStart` 路径）：
 
 ```ini
 [Unit]
@@ -98,24 +98,24 @@ ReadWritePaths=%h
 WantedBy=default.target
 ```
 
-**3. Enable and start:**
+**3. 启用并启动：**
 
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now nanobot-gateway
 ```
 
-**Common operations:**
+**常见操作：**
 
 ```bash
-systemctl --user status nanobot-gateway        # check status
-systemctl --user restart nanobot-gateway       # restart after config changes
-journalctl --user -u nanobot-gateway -f        # follow logs
+systemctl --user status nanobot-gateway        # 检查状态
+systemctl --user restart nanobot-gateway       # 配置更改后重启
+journalctl --user -u nanobot-gateway -f        # 跟踪日志
 ```
 
-If you edit the `.service` file itself, run `systemctl --user daemon-reload` before restarting.
+如果你编辑了 `.service` 文件本身，请在重启前运行 `systemctl --user daemon-reload`。
 
-> **Note:** User services only run while you are logged in. To keep the gateway running after logout, enable lingering:
+> **注意：** 用户服务仅在你登录时运行。要在登出后保持网关运行，请启用 lingering：
 >
 > ```bash
 > loginctl enable-linger $USER
@@ -123,17 +123,17 @@ If you edit the `.service` file itself, run `systemctl --user daemon-reload` bef
 
 ## macOS LaunchAgent
 
-Use a LaunchAgent when you want `nanobot gateway` to stay online after you log in, without keeping a terminal open.
+当你希望 `nanobot gateway` 在登录后保持在线而无需打开终端时，使用 LaunchAgent。
 
-**1. Get the absolute `nanobot` path:**
+**1. 获取绝对 `nanobot` 路径：**
 
 ```bash
-which nanobot   # e.g. /Users/youruser/.local/bin/nanobot
+which nanobot   # 例如 /Users/youruser/.local/bin/nanobot
 ```
 
-Use that exact path in the plist. It keeps the Python environment from your install method.
+在 plist 中使用精确路径。它会保留你安装方式中的 Python 环境。
 
-**2. Create `~/Library/LaunchAgents/ai.nanobot.gateway.plist`:**
+**2. 创建 `~/Library/LaunchAgents/ai.nanobot.gateway.plist`：**
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -172,7 +172,7 @@ Use that exact path in the plist. It keeps the Python environment from your inst
 </plist>
 ```
 
-**3. Load and start it:**
+**3. 加载并启动：**
 
 ```bash
 mkdir -p ~/Library/LaunchAgents ~/.nanobot/logs
@@ -181,14 +181,14 @@ launchctl enable gui/$(id -u)/ai.nanobot.gateway
 launchctl kickstart -k gui/$(id -u)/ai.nanobot.gateway
 ```
 
-**Common operations:**
+**常见操作：**
 
 ```bash
 launchctl list | grep ai.nanobot.gateway
-launchctl kickstart -k gui/$(id -u)/ai.nanobot.gateway   # restart
+launchctl kickstart -k gui/$(id -u)/ai.nanobot.gateway   # 重启
 launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/ai.nanobot.gateway.plist
 ```
 
-After editing the plist, run `launchctl bootout ...` and `launchctl bootstrap ...` again.
+编辑 plist 后，需再次运行 `launchctl bootout ...` 和 `launchctl bootstrap ...`。
 
-> **Note:** if startup fails with "address already in use", stop the manually started `nanobot gateway` process first.
+> **注意：** 如果启动失败并提示"address already in use"，请先停止手动启动的 `nanobot gateway` 进程。

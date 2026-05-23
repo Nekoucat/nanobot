@@ -1,4 +1,45 @@
-"""Context builder for assembling agent prompts."""
+"""
+上下文构建器 (Context Builder)
+
+负责组装发送给 LLM 的完整消息列表，包括系统提示和用户消息。
+
+核心职责：
+1. 构建系统提示（System Prompt）
+   - 身份定义：Agent 的人格和行为准则
+   - 启动文件：从工作区加载 AGENTS.md, SOUL.md, USER.md
+   - 工具契约：工具使用说明和约束
+   - 记忆系统：长期记忆和最近历史
+   - 技能模块：可用技能的描述
+
+2. 构建用户消息（User Message）
+   - 文本内容
+   - 图像附件（base64 编码）
+   - 运行时元数据（时间、渠道、聊天 ID 等）
+
+3. 消息合并策略
+   - 避免连续同角色消息（部分供应商不支持）
+   - 运行时上下文附加在用户消息末尾
+   - 支持多模态内容（文本 + 图像）
+
+架构设计：
+- ContextBuilder 被 AgentLoop 持有，每次调用 build_messages()
+- 使用 MemoryStore 加载长期记忆
+- 使用 SkillsLoader 加载技能定义
+- 从 templates/ 目录加载提示模板
+
+输出结构::
+
+    [
+        {"role": "system", "content": "完整的系统提示..."},
+        ...历史消息...,
+        {"role": "user", "content": "用户消息\n\n[Runtime Context...]"}
+    ]
+
+配置依赖：
+- workspace: 工作目录路径（用于加载文件和记忆）
+- timezone: 时区设置（用于显示当前时间）
+- disabled_skills: 要禁用的技能列表
+"""
 
 import base64
 import mimetypes
@@ -20,13 +61,56 @@ from nanobot.utils.prompt_templates import render_template
 
 
 class ContextBuilder:
-    """Builds the context (system prompt + messages) for the agent."""
+    """
+    上下文构建器 (Context Builder)
 
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
-    _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
-    _MAX_RECENT_HISTORY = 50
-    _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
-    _RUNTIME_CONTEXT_END = "[/Runtime Context]"
+    负责组装完整的 LLM 输入消息，是 Agent 智能行为的核心组件。
+
+    系统提示组成（按顺序）：
+    1. 身份 (Identity): Agent 的基本定义和运行环境信息
+    2. 启动文件 (Bootstrap): AGENTS.md, SOUL.md, USER.md（如果存在）
+    3. 工具契约 (Tool Contract): 工具使用规范和安全约束
+    4. 长期记忆 (Memory): MEMORY.md 文件的内容
+    5. 常驻技能 (Always Skills): 始终激活的技能说明
+    6. 技能索引 (Skills Index): 可用技能的摘要列表
+    7. 最近历史 (Recent History): 未处理的历史事件
+    8. 会话摘要 (Session Summary): 来自压缩的上下文摘要
+
+    运行时元数据 (Runtime Context)：
+    - 当前时间、渠道、聊天 ID、发送者 ID
+    - 目标状态信息（持续目标的进度）
+    - 标记为"非指令"，防止 LLM 将其作为指令执行
+
+    Attributes:
+        BOOTSTRAP_FILES: 要加载的启动文件名列表
+        _RUNTIME_CONTEXT_TAG: 运行时上下文的开始标记
+        _MAX_RECENT_HISTORY: 最大历史事件数量
+        _MAX_HISTORY_CHARS: 历史部分的最大字符数
+        _RUNTIME_CONTEXT_END: 运行时上下文的结束标记
+
+    使用示例::
+
+        builder = ContextBuilder(
+            workspace=Path("~/.nanobot/workspace"),
+            timezone="Asia/Shanghai",
+            disabled_skills=["summarize"]
+        )
+
+        messages = builder.build_messages(
+            history=session.get_history(),
+            current_message="帮我分析这段代码",
+            media=["/path/to/image.png"],
+            channel="telegram",
+            chat_id="12345",
+        )
+        # messages 现在可以传给 Provider.chat()
+    """
+
+    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]   # 启动文件列表
+    _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"  # 运行时标记开头
+    _MAX_RECENT_HISTORY = 50                                    # 最大历史事件数
+    _MAX_HISTORY_CHARS = 32_000                                 # 历史字符上限
+    _RUNTIME_CONTEXT_END = "[/Runtime Context]"                 # 运行时标记结尾
 
     def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
         self.workspace = workspace
